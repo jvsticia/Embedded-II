@@ -1,19 +1,9 @@
 /*
  * DS3231 RTC over I2C using bcm2835 on Raspberry Pi 4
- *
- * Commands:
- *   sudo ./rtc set    -> set RTC from Pi system time (12-hour format)
- *   sudo ./rtc read   -> read RTC and print
- *
- * Wiring:
- *   DS3231 VCC -> Pi 3V3 (Pin 1)
- *   DS3231 GND -> Pi GND (Pin 6)
- *   DS3231 SDA -> Pi SDA1 GPIO2 (Pin 3)
- *   DS3231 SCL -> Pi SCL1 GPIO3 (Pin 5)
- *
- * Compile:
- *   gcc -O2 -Wall -o rtc rtc.c -lbcm2835
- */
+ * supports two commands
+ * sudo ./rtc set reads the current system time and converts into RTC register formagt
+ * sudo ./rtc read reads the RTC register converst from BCD into values
+*/
 
 #include <bcm2835.h>
 #include <stdio.h>
@@ -21,51 +11,49 @@
 #include <string.h>
 #include <time.h>
 
-#define DS3231_ADDR   0x68
+#define DS3231_ADDR   0x68 //the 7 bit I2C address of the RTC
 
-// Time/date registers (spec says 0x00–0x06)
-#define REG_SEC       0x00
-#define REG_MIN       0x01
-#define REG_HOUR      0x02
-#define REG_DOW       0x03
-#define REG_DATE      0x04
-#define REG_MONTH     0x05
-#define REG_YEAR      0x06
+// Time registers
+#define SEC       0x00 //seconds
+#define MIN       0x01 //minutes
+#define HOUR      0x02 //hours
+#define DAY       0x03 //day of the week
+#define DATE      0x04 // the day of the month
+#define MONTH     0x05 // month
+#define YEAR      0x06 //year
 
-// Status register (for OSF flag)
+// Status register (for stop flag)
 #define REG_STATUS    0x0F
 
+// RTC stores time in Binary coded decimal
+//conversion measures
 static uint8_t dec2bcd(uint8_t d) { return (uint8_t)(((d / 10) << 4) | (d % 10)); }
 static uint8_t bcd2dec(uint8_t b) { return (uint8_t)(((b >> 4) * 10) + (b & 0x0F)); }
 
-/*
- * Write len bytes starting at start_reg.
- * I2C on bus: START -> 0x68(W) -> start_reg -> data... -> STOP
- */
-static int rtc_write_regs(uint8_t start_reg, const uint8_t *data, uint8_t len)
+// writes multiple bytes starting at the start_reg
+static int rtc_write(uint8_t start_reg, const uint8_t *data, uint8_t len)
 {
+    //creates a buffer to hold the first byte(register address
     uint8_t buf[32];
     if ((uint8_t)(len + 1) > sizeof(buf)) return -1;
-
+    // error check to not overflow buf
     buf[0] = start_reg;
     for (uint8_t i = 0; i < len; i++) buf[i + 1] = data[i];
-
-    return bcm2835_i2c_write((char *)buf, (uint32_t)(len + 1)); // 0 = success
+    // builds the buffer with return
+    return i2c_write((char *)buf, (uint32_t)(len + 1));
 }
 
-/*
- * Read len bytes starting at start_reg.
- * I2C on bus: START -> 0x68(W) -> start_reg -> RESTART -> 0x68(R) -> data... -> STOP
- */
+// Read multiple bytes sytarting at start_reg
+//performs a repeated start then read the bytes
 static int rtc_read_regs(uint8_t start_reg, uint8_t *data, uint8_t len)
 {
     uint8_t buf[1];
     buf[0] = start_reg;
 
-    return bcm2835_i2c_write_read_rs((char*)buf,1, (char*)data, len);
+    return i2c_write_read_rs((char*)buf,1, (char*)data, len);
 }
 
-// Convert tm_wday (0=Sun..6=Sat) -> DS3231 DOW (1=Mon..7=Sun)
+// Day of the week conversion
 static uint8_t tm_to_dow_1_mon(const struct tm *t)
 {
     if (t->tm_wday == 0) return 7;         // Sunday -> 7
@@ -81,7 +69,7 @@ static uint8_t build_hour_12h(uint8_t hour24)
 
     // bit6=1 -> 12h mode
     // bit5=PM
-    // bits4..0 = BCD hour (01..12)
+    // bits4-0 = BCD hour
     return (uint8_t)((1u << 6) | (pm ? (1u << 5) : 0) | (dec2bcd(hour12) & 0x1F));
 }
 
@@ -116,7 +104,7 @@ static void print_time_regs(uint8_t regs[7])
     const char *dow_str = (dow <= 7) ? dow_names[dow] : "?";
 
     printf("%s %02u/%02u/20%02u  %02u:%02u:%02u %s\n",
-           dow_str, mon, date, yr, hour12, min, sec, pm ? "PM" : "AM");
+           dow_str, mon, date, yr, hour12, MIN, sec, pm ? "PM" : "AM");
 }
 
 static int rtc_set_from_system_time(void)
@@ -127,14 +115,14 @@ static int rtc_set_from_system_time(void)
 
     uint8_t regs[7];
     regs[0] = dec2bcd((uint8_t)t->tm_sec);
-    regs[1] = dec2bcd((uint8_t)t->tm_min);
+    regs[1] = dec2bcd((uint8_t)t->tm_MIN);
     regs[2] = build_hour_12h((uint8_t)t->tm_hour);
     regs[3] = dec2bcd(tm_to_dow_1_mon(t));
     regs[4] = dec2bcd((uint8_t)t->tm_mday);
     regs[5] = dec2bcd((uint8_t)(t->tm_mon + 1));
     regs[6] = dec2bcd((uint8_t)(t->tm_year % 100));
 
-    int rc = rtc_write_regs(REG_SEC, regs, 7);
+    int rc = rtc_write(SEC, regs, 7);
     if (rc != 0) return rc;
 
     // Clear OSF (Oscillator Stop Flag) bit7 in STATUS register
@@ -142,7 +130,7 @@ static int rtc_set_from_system_time(void)
     rc = rtc_read_regs(REG_STATUS, &status, 1);
     if (rc == 0) {
         status &= ~(1u << 7);
-        rtc_write_regs(REG_STATUS, &status, 1);
+        rtc_write(REG_STATUS, &status, 1);
     }
 
     return 0;
@@ -151,7 +139,7 @@ static int rtc_set_from_system_time(void)
 static int rtc_read_and_print(void)
 {
     uint8_t regs[7] = {0};
-    int rc = rtc_read_regs(REG_SEC, regs, 7);
+    int rc = rtc_read_regs(SEC, regs, 7);
     if (rc != 0) return rc;
 
     print_time_regs(regs);
